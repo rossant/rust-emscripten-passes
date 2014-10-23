@@ -39,10 +39,15 @@ namespace {
     BreakStructArguments() : ModulePass(ID) { }
 
     virtual bool runOnModule(Module &M) {
-      // Step 0: Find all functions with struct arguments.
+      // Step 0: Find all functions with struct arguments or return values.
       vector<Function*> StructArgFuncs;
       for (Module::iterator F = M.begin(), FE = M.end(); F != FE; ++F) {
         errs() << "function: " << F->getName() << '\n';
+        if (F->getReturnType()->getTypeID() == Type::StructTyID) {
+          errs() << "  found struct return on " << F->getName() << '\n';
+          assert(!F->isDeclaration() && "can't flatten nonlocal functions");
+          StructArgFuncs.push_back(&*F);
+        }
         for (Function::arg_iterator A = F->arg_begin(), AE = F->arg_end(); A != AE; ++A) {
           if (A->getType()->getTypeID() == Type::StructTyID) {
             errs() << "  found struct argument on " << F->getName() << '\n';
@@ -73,6 +78,13 @@ namespace {
         vector<Value*> ArgVals;
 
         Function::arg_iterator NewA = NewF->arg_begin();
+
+        Value* OutPtr = NULL;
+        if (OldF->getReturnType()->getTypeID() == Type::StructTyID) {
+            OutPtr = &*NewA;
+            ++NewA;
+        }
+
         for (Function::arg_iterator OldA = OldF->arg_begin(), OldAE = OldF->arg_end(); OldA != OldAE; ++OldA) {
           // packArgument advances NewA as needed.
           Value *PackedArg = packArgument(Build, &*OldA, NewA);
@@ -82,6 +94,9 @@ namespace {
 
         CallInst *Call = Build.CreateCall(OldF, ArgVals);
         if (OldF->getReturnType()->getTypeID() == Type::VoidTyID) {
+          Build.CreateRetVoid();
+        } else if (OutPtr != NULL) {
+          Build.CreateStore(Call, OutPtr);
           Build.CreateRetVoid();
         } else {
           Build.CreateRet(Call);
@@ -97,57 +112,9 @@ namespace {
         for (Function::iterator BB = F->begin(), BBE = F->end(); BB != BBE; ++BB) {
           for (BasicBlock::iterator I = BB->begin(), IE = BB->end(); I != IE; ++I) {
             if (InvokeInst *Invoke = dyn_cast<InvokeInst>(&*I)) {
-              IRBuilder<> Build(&*BB, I);
-
-              Value *OldFuncPtr = Invoke->getCalledValue();
-              PointerType *OldFuncPtrType = dyn_cast<PointerType>(OldFuncPtr->getType());
-              Type *OldFuncType = OldFuncPtrType->getElementType();
-              Type *NewFuncType = flattenType(dyn_cast<FunctionType>(OldFuncType));
-              PointerType *NewFuncPtrType = PointerType::get(NewFuncType, OldFuncPtrType->getAddressSpace());
-
-              if (NewFuncType == OldFuncType) {
-                continue;
-              }
-
-              Value *NewFuncPtr = Build.CreateBitCast(OldFuncPtr, NewFuncPtrType);
-
-              errs() << "want to fixup invoke:\n"
-                << *Invoke << '\n'
-                << "  old func ty: " << *OldFuncType << '\n'
-                << "  new func ty: " << *NewFuncType << '\n';
-
-              vector<Value*> NewArgs;
-              for (unsigned I = 0, E = Invoke->getNumArgOperands(); I != E; ++I) {
-                unpackArgumentInto(Build, NewArgs, Invoke->getArgOperand(I));
-              }
-              Build.CreateInvoke(NewFuncPtr, Invoke->getNormalDest(), Invoke->getUnwindDest(), NewArgs);
-              DeadCalls.push_back(Invoke);
+              handleCallOrInvoke(&*BB, Invoke, DeadCalls, buildNewInvoke);
             } else if (CallInst *Call = dyn_cast<CallInst>(&*I)) {
-              IRBuilder<> Build(&*BB, I);
-
-              Value *OldFuncPtr = Call->getCalledValue();
-              PointerType *OldFuncPtrType = dyn_cast<PointerType>(OldFuncPtr->getType());
-              Type *OldFuncType = OldFuncPtrType->getElementType();
-              Type *NewFuncType = flattenType(dyn_cast<FunctionType>(OldFuncType));
-              PointerType *NewFuncPtrType = PointerType::get(NewFuncType, OldFuncPtrType->getAddressSpace());
-
-              if (NewFuncType == OldFuncType) {
-                continue;
-              }
-
-              Value *NewFuncPtr = Build.CreateBitCast(OldFuncPtr, NewFuncPtrType);
-
-              errs() << "want to fixup call:\n"
-                << *Call << '\n'
-                << "  old func ty: " << *OldFuncType << '\n'
-                << "  new func ty: " << *NewFuncType << '\n';
-
-              vector<Value*> NewArgs;
-              for (unsigned I = 0, E = Call->getNumArgOperands(); I != E; ++I) {
-                unpackArgumentInto(Build, NewArgs, Call->getArgOperand(I));
-              }
-              Build.CreateCall(NewFuncPtr, NewArgs);
-              DeadCalls.push_back(Call);
+              handleCallOrInvoke(&*BB, Call, DeadCalls, buildNewCall);
             }
           }
         }
@@ -161,8 +128,68 @@ namespace {
       return true;
     }
 
+    static CallInst *buildNewCall(IRBuilder<> &Build, CallInst *OldCall, Value *NewFuncPtr, vector<Value*> &NewArgs) {
+      return Build.CreateCall(NewFuncPtr, NewArgs);
+    }
+
+    static InvokeInst *buildNewInvoke(IRBuilder<> &Build, InvokeInst *OldInvoke, Value *NewFuncPtr, vector<Value*> &NewArgs) {
+      return Build.CreateInvoke(NewFuncPtr, OldInvoke->getNormalDest(), OldInvoke->getUnwindDest(), NewArgs);
+    }
+
+    template <typename CallOrInvokeInst>
+    void handleCallOrInvoke(BasicBlock *BB, CallOrInvokeInst *Call, vector<Instruction*> &DeadCalls,
+                            CallOrInvokeInst *(*BuildNewInst)(IRBuilder<>&, CallOrInvokeInst*, Value*, vector<Value*>&)) {
+      IRBuilder<> Build(BB, Call);
+
+      Value *OldFuncPtr = Call->getCalledValue();
+      PointerType *OldFuncPtrType = dyn_cast<PointerType>(OldFuncPtr->getType());
+      FunctionType *OldFuncType = dyn_cast<FunctionType>(OldFuncPtrType->getElementType());
+      Type *NewFuncType = flattenType(dyn_cast<FunctionType>(OldFuncType));
+      PointerType *NewFuncPtrType = PointerType::get(NewFuncType, OldFuncPtrType->getAddressSpace());
+
+      if (NewFuncType == OldFuncType) {
+        return;
+      }
+
+      Value *NewFuncPtr = Build.CreateBitCast(OldFuncPtr, NewFuncPtrType);
+
+      errs() << "want to fixup call:\n"
+        << *Call << '\n'
+        << "  old func ty: " << *OldFuncType << '\n'
+        << "  new func ty: " << *NewFuncType << '\n';
+
+      vector<Value*> NewArgs;
+      Value* OutPtr = NULL;
+
+      if (OldFuncType->getReturnType()->getTypeID() == Type::StructTyID) {
+        OutPtr = Build.CreateAlloca(OldFuncType->getReturnType());
+        NewArgs.push_back(OutPtr);
+      }
+
+      for (unsigned I = 0, E = Call->getNumArgOperands(); I != E; ++I) {
+        unpackArgumentInto(Build, NewArgs, Call->getArgOperand(I));
+      }
+
+      Value* NewCall = BuildNewInst(Build, Call, NewFuncPtr, NewArgs);
+
+      if (OutPtr == NULL) {
+        Call->replaceAllUsesWith(NewCall);
+      } else {
+        Value* OutVal = Build.CreateLoad(OutPtr);
+        Call->replaceAllUsesWith(OutVal);
+      }
+
+      DeadCalls.push_back(Call);
+    }
+
     FunctionType *flattenType(FunctionType *Ty) {
       vector<Type*> ArgTys;
+
+      Type* RetTy = Ty->getReturnType();;
+      if (StructType *StructTy = dyn_cast<StructType>(RetTy)) {
+          ArgTys.push_back(PointerType::getUnqual(StructTy));
+          RetTy = Type::getVoidTy(Ty->getContext());
+      }
 
       for (FunctionType::param_iterator I = Ty->param_begin(), E = Ty->param_end(); I != E; ++I) {
         if (StructType *StructTy = dyn_cast<StructType>(*I)) {
@@ -172,7 +199,7 @@ namespace {
         }
       }
 
-      return FunctionType::get(Ty->getReturnType(), ArgTys, Ty->isVarArg());
+      return FunctionType::get(RetTy, ArgTys, Ty->isVarArg());
     }
 
     void flattenStructInto(vector<Type*>& ArgTys, StructType *Ty) {
