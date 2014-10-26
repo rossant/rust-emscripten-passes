@@ -42,15 +42,12 @@ namespace {
       // Step 0: Find all functions with struct arguments or return values.
       vector<Function*> StructArgFuncs;
       for (Module::iterator F = M.begin(), FE = M.end(); F != FE; ++F) {
-        errs() << "function: " << F->getName() << '\n';
         if (F->getReturnType()->getTypeID() == Type::StructTyID) {
-          errs() << "  found struct return on " << F->getName() << '\n';
           assert(!F->isDeclaration() && "can't flatten nonlocal functions");
           StructArgFuncs.push_back(&*F);
         }
         for (Function::arg_iterator A = F->arg_begin(), AE = F->arg_end(); A != AE; ++A) {
           if (A->getType()->getTypeID() == Type::StructTyID) {
-            errs() << "  found struct argument on " << F->getName() << '\n';
             assert(!F->isDeclaration() && "can't flatten nonlocal functions");
             StructArgFuncs.push_back(&*F);
           }
@@ -79,17 +76,18 @@ namespace {
 
         Function::arg_iterator NewA = NewF->arg_begin();
 
+        for (Function::arg_iterator OldA = OldF->arg_begin(), OldAE = OldF->arg_end(); OldA != OldAE; ++OldA) {
+          // packArgument advances NewA as needed.
+          Value *PackedArg = packArgument(Build, &*OldA, NewA);
+          ArgVals.push_back(PackedArg);
+        }
+
         Value* OutPtr = NULL;
         if (OldF->getReturnType()->getTypeID() == Type::StructTyID) {
             OutPtr = &*NewA;
             ++NewA;
         }
 
-        for (Function::arg_iterator OldA = OldF->arg_begin(), OldAE = OldF->arg_end(); OldA != OldAE; ++OldA) {
-          // packArgument advances NewA as needed.
-          Value *PackedArg = packArgument(Build, &*OldA, NewA);
-          ArgVals.push_back(PackedArg);
-        }
         assert(NewA == NewF->arg_end());
 
         CallInst *Call = Build.CreateCall(OldF, ArgVals);
@@ -153,21 +151,15 @@ namespace {
 
       Value *NewFuncPtr = Build.CreateBitCast(OldFuncPtr, NewFuncPtrType);
 
-      errs() << "want to fixup call:\n"
-        << *Call << '\n'
-        << "  old func ty: " << *OldFuncType << '\n'
-        << "  new func ty: " << *NewFuncType << '\n';
-
       vector<Value*> NewArgs;
-      Value* OutPtr = NULL;
+      for (unsigned I = 0, E = Call->getNumArgOperands(); I != E; ++I) {
+        unpackArgumentInto(Build, NewArgs, Call->getArgOperand(I));
+      }
 
+      Value* OutPtr = NULL;
       if (OldFuncType->getReturnType()->getTypeID() == Type::StructTyID) {
         OutPtr = Build.CreateAlloca(OldFuncType->getReturnType());
         NewArgs.push_back(OutPtr);
-      }
-
-      for (unsigned I = 0, E = Call->getNumArgOperands(); I != E; ++I) {
-        unpackArgumentInto(Build, NewArgs, Call->getArgOperand(I));
       }
 
       Value* NewCall = BuildNewInst(Build, Call, NewFuncPtr, NewArgs);
@@ -185,18 +177,18 @@ namespace {
     FunctionType *flattenType(FunctionType *Ty) {
       vector<Type*> ArgTys;
 
-      Type* RetTy = Ty->getReturnType();;
-      if (StructType *StructTy = dyn_cast<StructType>(RetTy)) {
-          ArgTys.push_back(PointerType::getUnqual(StructTy));
-          RetTy = Type::getVoidTy(Ty->getContext());
-      }
-
       for (FunctionType::param_iterator I = Ty->param_begin(), E = Ty->param_end(); I != E; ++I) {
         if (StructType *StructTy = dyn_cast<StructType>(*I)) {
           flattenStructInto(ArgTys, StructTy);
         } else {
           ArgTys.push_back(*I);
         }
+      }
+
+      Type* RetTy = Ty->getReturnType();
+      if (StructType *StructTy = dyn_cast<StructType>(RetTy)) {
+          ArgTys.push_back(PointerType::getUnqual(StructTy));
+          RetTy = Type::getVoidTy(Ty->getContext());
       }
 
       return FunctionType::get(RetTy, ArgTys, Ty->isVarArg());
