@@ -42,14 +42,19 @@ namespace {
       // Step 0: Find all functions with struct arguments or return values.
       vector<Function*> StructArgFuncs;
       for (Module::iterator F = M.begin(), FE = M.end(); F != FE; ++F) {
+        if (F->isIntrinsic()) {
+          continue;
+        }
         if (F->getReturnType()->getTypeID() == Type::StructTyID) {
           assert(!F->isDeclaration() && "can't flatten nonlocal functions");
           StructArgFuncs.push_back(&*F);
+          continue;
         }
         for (Function::arg_iterator A = F->arg_begin(), AE = F->arg_end(); A != AE; ++A) {
           if (A->getType()->getTypeID() == Type::StructTyID) {
             assert(!F->isDeclaration() && "can't flatten nonlocal functions");
             StructArgFuncs.push_back(&*F);
+            break;
           }
         }
       }
@@ -140,6 +145,11 @@ namespace {
       IRBuilder<> Build(BB, Call);
 
       Value *OldFuncPtr = Call->getCalledValue();
+      if (Function *OldFunc = dyn_cast<Function>(OldFuncPtr)) {
+        if (OldFunc->isIntrinsic()) {
+          return;
+        }
+      }
       PointerType *OldFuncPtrType = dyn_cast<PointerType>(OldFuncPtr->getType());
       FunctionType *OldFuncType = dyn_cast<FunctionType>(OldFuncPtrType->getElementType());
       Type *NewFuncType = flattenType(dyn_cast<FunctionType>(OldFuncType));
